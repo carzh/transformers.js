@@ -19,9 +19,9 @@
 // NOTE: Import order matters here. We need to import `onnxruntime-node` before `onnxruntime-web`.
 // In either case, we select the default export if it exists, otherwise we use the named export.
 import * as ONNX_NODE from 'onnxruntime-node';
-import * as ONNX_WEB from 'onnxruntime-web';
+import * as ONNX_WEB from 'onnxruntime-web/training';
 
-/** @type {import('onnxruntime-web')} The ONNX runtime module. */
+/** @type {import('onnxruntime-web/training')} The ONNX runtime module. */
 export let ONNX;
 
 export const executionProviders = [

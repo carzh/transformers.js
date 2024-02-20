@@ -29,7 +29,7 @@ export default {
         new CopyWebpackPlugin({
             patterns: [
                 {
-                    from: 'node_modules/onnxruntime-web/dist/*.wasm',
+                    from: 'node_modules/onnxruntime-web/dist/ort-training-wasm-simd.wasm',
                     to: 'dist/[name][ext]'
                 },
             ],
