@@ -83,9 +83,10 @@ import {
 
 import { executionProviders, ONNX } from './backends/onnx.js';
 import { medianFilter } from './transformers.js';
-const { InferenceSession, Tensor: ONNXTensor, env } = ONNX;
+const { InferenceSession, TrainingSession, Tensor: ONNXTensor, env } = ONNX;
 
-/** @typedef {import('onnxruntime-web').InferenceSession} InferenceSession */
+/** @typedef {import('onnxruntime-web/training').TrainingSession} TrainingSession */
+/** @typedef {import('onnxruntime-web/training').InferenceSession} InferenceSession */
 
 //////////////////////////////////////////////////
 // Model types: used internally
@@ -114,7 +115,7 @@ const MODEL_CLASS_TO_NAME_MAPPING = new Map();
  * @param {string} pretrained_model_name_or_path The path to the directory containing the model file.
  * @param {string} fileName The name of the model file.
  * @param {import('./utils/hub.js').PretrainedOptions} options Additional options for loading the model.
- * @returns {Promise<InferenceSession>} A Promise that resolves to an InferenceSession object.
+ * @returns {Promise<TrainingSession>} A Promise that resolves to an InferenceSession object.
  * @private
  */
 async function constructSession(pretrained_model_name_or_path, fileName, options) {
@@ -122,30 +123,36 @@ async function constructSession(pretrained_model_name_or_path, fileName, options
     let modelFileName = `onnx/${fileName}${options.quantized ? '_quantized' : ''}.onnx`;
     let buffer = await getModelFile(pretrained_model_name_or_path, modelFileName, true, options);
 
+    const trainCreateOptions = {
+        // checkpointState: 'public/checkpoint',
+        // trainModel: 'public/training_model.onnx',
+        // evalModel: 'public/eval_model.onnx',
+        // optimizerModel: 'public/optimizer_model.onnx',
+        checkpointState: '/../assets/artifacts/mnist/checkpoint.ckpt',
+        trainModel: '/../assets/artifacts/mnist/training_model.onnx',
+        optimizerModel: '/../assets/artifacts/mnist/optimizer_model.onnx',
+        evalModel: '/../assets/artifacts/mnist/eval_model.onnx',
+    }
+
     try {
-        return await InferenceSession.create(buffer, {
-            executionProviders,
-        });
+        return await TrainingSession.create(trainCreateOptions);
     } catch (err) {
         // If the execution provided was only wasm, throw the error
         if (executionProviders.length === 1 && executionProviders[0] === 'wasm') {
             throw err;
         }
 
+        // will never reach this part bc will be using wasm for training demo
         console.warn(err);
         console.warn(
-            'Something went wrong during model construction (most likely a missing operation). ' +
-            'Using `wasm` as a fallback. '
+            'Something went wrong during model construction (most likely a missing operation). '
         )
-        return await InferenceSession.create(buffer, {
-            executionProviders: ['wasm']
-        });
     }
 }
 
 /**
  * Validate model inputs
- * @param {InferenceSession} session The InferenceSession object that will be run.
+ * @param {TrainingSession} session The InferenceSession object that will be run.
  * @param {Record<string, Tensor>} inputs The inputs to check.
  * @returns {Record<string, Tensor>} The checked inputs.
  * @throws {Error} If any inputs are missing.
@@ -158,7 +165,7 @@ function validateInputs(session, inputs) {
      */
     const checkedInputs = Object.create(null);
     const missingInputs = [];
-    for (const inputName of session.inputNames) {
+    for (const inputName of session.evalInputNames) {
         const tensor = inputs[inputName];
         // Rare case where one of the model's input names corresponds to a built-in
         // object name (e.g., toString), which would cause a simple (!tensor) check to fail,
@@ -178,11 +185,11 @@ function validateInputs(session, inputs) {
     }
 
     const numInputsProvided = Object.keys(inputs).length;
-    const numInputsNeeded = session.inputNames.length;
+    const numInputsNeeded = session.evalInputNames.length;
     if (numInputsProvided > numInputsNeeded) {
         // No missing inputs, but too many inputs were provided.
         // Warn the user and ignore the extra inputs.
-        let ignored = Object.keys(inputs).filter(inputName => !session.inputNames.includes(inputName));
+        let ignored = Object.keys(inputs).filter(inputName => !session.evalInputNames.includes(inputName));
         console.warn(`WARNING: Too many inputs were provided (${numInputsProvided} > ${numInputsNeeded}). The following inputs will be ignored: "${ignored.join(', ')}".`);
     }
 
@@ -195,7 +202,7 @@ function validateInputs(session, inputs) {
  *  - If additional inputs are passed, they will be ignored.
  *  - If inputs are missing, an error will be thrown.
  * 
- * @param {InferenceSession} session The InferenceSession object to run.
+ * @param {TrainingSession} session The InferenceSession object to run.
  * @param {Object} inputs An object that maps input names to input tensors.
  * @returns {Promise<Object>} A Promise that resolves to an object that maps output names to output tensors.
  * @private
@@ -204,7 +211,8 @@ async function sessionRun(session, inputs) {
     const checkedInputs = validateInputs(session, inputs);
     try {
         // @ts-ignore
-        let output = await session.run(checkedInputs);
+        let output = await session.runEvalStep(checkedInputs);
+        // TODO: double-check tht replaceTensors will ignore the loss node
         output = replaceTensors(output);
         return output;
     } catch (e) {
@@ -308,7 +316,7 @@ function prepareAttentionMask(self, tokens) {
  * @private
  */
 function preparePositionIds(session, feeds, use_cache_branch) {
-    if (!session.inputNames.includes('position_ids')) return;
+    if (!session.evalInputNames.includes('position_ids')) return;
 
     const data = new BigInt64Array(feeds.attention_mask.data.length);
 
@@ -366,11 +374,11 @@ async function seq2seqForward(self, model_inputs) {
     };
     const use_cache_branch = !!past_key_values;
 
-    if (self.decoder_merged_session.inputNames.includes('use_cache_branch')) {
+    if (self.decoder_merged_session.evalInputNames.includes('use_cache_branch')) {
         decoderFeeds.use_cache_branch = boolTensor(use_cache_branch);
     }
 
-    if (self.decoder_merged_session.inputNames.includes('encoder_attention_mask')) {
+    if (self.decoder_merged_session.evalInputNames.includes('encoder_attention_mask')) {
         decoderFeeds.encoder_attention_mask = model_inputs.attention_mask
     }
 
@@ -505,10 +513,10 @@ function seq2seqUpdatebeam(beam, newTokenId) {
  */
 async function encoderForward(self, model_inputs) {
     const encoderFeeds = Object.create(null);
-    for (const key of self.session.inputNames) {
+    for (const key of self.session.evalInputNames) {
         encoderFeeds[key] = model_inputs[key];
     }
-    if (self.session.inputNames.includes('token_type_ids') && !encoderFeeds.token_type_ids) {
+    if (self.session.evalInputNames.includes('token_type_ids') && !encoderFeeds.token_type_ids) {
         // Assign default `token_type_ids` (all zeroes) to the `encoderFeeds` if the model expects it,
         // but they weren't created by the tokenizer.
         encoderFeeds.token_type_ids = new Tensor(
@@ -536,7 +544,7 @@ async function decoderForward(self, model_inputs) {
     }
     const use_cache_branch = !!past_key_values;
 
-    if (self.session.inputNames.includes('use_cache_branch')) {
+    if (self.session.evalInputNames.includes('use_cache_branch')) {
         decoderFeeds.use_cache_branch = boolTensor(use_cache_branch);
     }
 
